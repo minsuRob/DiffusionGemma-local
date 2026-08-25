@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+conversations.db
+.model.lock
+bench_results.json
+limits_results.json
