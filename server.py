@@ -16,6 +16,8 @@ Prints a LAN URL with an access token on startup.
 import argparse
 import asyncio
 import atexit
+import hashlib
+import io
 import json
 import os
 import queue
@@ -32,15 +34,24 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import mlx.core as mx
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
+from PIL import Image as PILImage
 from pydantic import BaseModel
 
-from mlx_vlm import load
+from mlx_vlm import load, stream_generate
 from mlx_vlm.generate.diffusion import stream_diffusion_generate_from_kwargs
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config, prepare_inputs, should_add_special_tokens
+
+import docvision
+import extract
 
 from context_guard import (
     HARD_CONTEXT_LIMIT,
@@ -57,7 +68,33 @@ DEFAULT_MODEL = "mlx-community/diffusiongemma-26B-A4B-it-4bit"
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "conversations.db"
 WEB_DIR = BASE_DIR / "web"
+UPLOAD_DIR = BASE_DIR / "uploads"
+SCHEMA_DIR = BASE_DIR / "schemas"
 MAX_QUEUE_DEPTH = 8
+
+# One tile of a table needs a few hundred tokens; this caps a runaway reply.
+EXTRACT_MAX_TOKENS = 700
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+# Picked instead of a schema when the image is not a table and should just be
+# read. Not a filename, so it can never collide with one in schemas/.
+READ_MODE_SENTINEL = "__read__"
+
+# Reasoning plus answer share this budget.
+READ_MAX_TOKENS = 1400
+
+READ_ANALYSIS_PROMPT = (
+    "이 이미지를 분석해라. 글자를 전부 옮겨 적지 말고, 아래 순서로 답한다.\n\n"
+    "1. 무엇인가 — 어떤 문서·화면인지, 어떤 구조인지, 무엇을 위한 것인지.\n"
+    "2. 핵심 내용 — 중요한 항목과 수치만. 전체 전사는 하지 않는다.\n"
+    "3. 특이사항 — 이상하거나 빠졌거나 눈에 띄는 점.\n\n"
+    "읽을 수 없는 부분은 추측해서 채우지 말고 읽을 수 없다고 명시해라. "
+    "확실한 것과 짐작한 것을 구분해서 써라."
+)
+
+
+class _Cancelled(Exception):
+    """Raised inside the extraction reader so a cancel unwinds the pipeline."""
 
 # ---------------------------------------------------------------------------
 # thinking-channel splitting
@@ -181,6 +218,13 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
         """
     )
+    # CREATE TABLE IF NOT EXISTS leaves an existing table alone, so new columns
+    # have to be added explicitly or a database from before this feature keeps
+    # the old shape and every insert fails.
+    have = {r["name"] for r in _db.execute("PRAGMA table_info(messages)")}
+    for column, decl in (("attachment", "TEXT"), ("extraction", "TEXT")):
+        if column not in have:
+            _db.execute(f"ALTER TABLE messages ADD COLUMN {column} {decl}")
     _db.commit()
 
 
@@ -205,10 +249,12 @@ def db_run(sql, params=(), fetch=None):
 
 
 class Job:
-    def __init__(self, conversation_id, loop):
+    def __init__(self, conversation_id, loop, kind="chat", payload=None):
         self.id = uuid.uuid4().hex
         self.conversation_id = conversation_id
         self.loop = loop
+        self.kind = kind  # "chat" | "extract"
+        self.payload = payload or {}
         self.events = asyncio.Queue()
         self.cancelled = threading.Event()
         self.created_at = time.time()
@@ -285,7 +331,14 @@ class Engine:
                 self.current = job
             self._broadcast_positions()
             try:
-                self._generate(job)
+                # Extraction runs on this same worker on purpose. It issues many
+                # image calls, and letting it overlap with a chat generation
+                # would put two model runs in flight and break the OOM
+                # guarantee the queue exists to provide.
+                if job.kind == "extract":
+                    self._extract(job)
+                else:
+                    self._generate(job)
             except Exception as e:  # keep the worker alive no matter what
                 job.emit("error", {"message": f"{type(e).__name__}: {e}"})
             finally:
@@ -338,6 +391,179 @@ class Engine:
             stream_kwargs,
             on_result=on_result,
         )
+
+    def _image_reader(self, job):
+        """A (pil_image, prompt, max_tokens=None) -> Reply callable.
+
+        Uses stream_generate rather than the diffusion path: _diffusion_stream
+        pins pixel_values to None and has never been exercised with an image,
+        while this route is the one the accuracy measurements were taken on.
+        Extraction wants correctness, not live denoising previews.
+        """
+        def read(pil_image, prompt, tokens=None, think=False):
+            if job.cancelled.is_set():
+                raise _Cancelled()
+            formatted = apply_chat_template(
+                self.processor, self.config,
+                [{"role": "user", "content": prompt}], num_images=1,
+                # Only the structure probe asks for reasoning; a tile read with
+                # thinking on burns its whole budget inside the thought channel
+                # and returns nothing. See extract_image's docstring.
+                enable_thinking=think,
+            )
+            chunks = []
+            last = None
+            for r in stream_generate(
+                self.model, self.processor, formatted,
+                image=pil_image,
+                max_tokens=tokens or EXTRACT_MAX_TOKENS,
+                temperature=0.0,
+                prefill_step_size=PREFILL_STEP_SIZE,
+            ):
+                chunks.append(r.text)
+                last = r
+            peak = getattr(last, "peak_memory", None)
+            if peak:
+                self.last_peak_gb = round(peak, 2)
+            # Thought is separated, not merged into the answer: mixing it in
+            # would feed reasoning prose to the row parser.
+            return extract.split_thought("".join(chunks))
+
+        return read
+
+    def _read_image(self, job):
+        """Free-form read of an image, for anything that is not a table.
+
+        No tiling and no consensus: those exist to pin down field values, and
+        neither majority-votes usefully over prose. This is explicitly the
+        unverified path, and the UI labels it as such.
+        """
+        img = docvision.load_image(job.payload["image_path"])
+        # Analysis, not transcription. The order of these three is the order we
+        # want the model to think in: establish what the thing is before
+        # deciding which parts of it matter.
+        question = job.payload.get("question") or READ_ANALYSIS_PROMPT
+        job.emit("start", {"mode": "read", "image_size": list(img.size)})
+
+        splitter = ChannelSplitter()
+        answer, thinking = [], []
+        last = None
+        t0 = time.time()
+        formatted = apply_chat_template(
+            self.processor, self.config,
+            [{"role": "user", "content": question}], num_images=1,
+            enable_thinking=True,
+        )
+        for r in stream_generate(
+            self.model, self.processor, formatted, image=img,
+            # Reasoning and answer share this budget, so it is larger than the
+            # chat default; a cut-off here would stop mid-thought silently.
+            max_tokens=max(self.max_tokens, READ_MAX_TOKENS),
+            temperature=self.temperature,
+            prefill_step_size=PREFILL_STEP_SIZE,
+        ):
+            if job.cancelled.is_set():
+                break
+            last = r
+            for kind, text in splitter.feed(r.text):
+                (thinking if kind == "thinking" else answer).append(text)
+                job.emit("token", {"kind": kind, "text": text})
+        for kind, text in splitter.flush():
+            (thinking if kind == "thinking" else answer).append(text)
+            job.emit("token", {"kind": kind, "text": text})
+
+        answer_text = "".join(answer).strip()
+        if job.cancelled.is_set() and not answer_text:
+            job.emit("cancelled", {})
+            return
+
+        msg_id = db_run(
+            "INSERT INTO messages (conversation_id, role, content, thinking, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (job.conversation_id, "assistant", answer_text,
+             "".join(thinking).strip() or None, time.time()),
+        )
+        db_run("UPDATE conversations SET updated_at=? WHERE id=?",
+               (time.time(), job.conversation_id))
+        peak = getattr(last, "peak_memory", None)
+        if peak:
+            self.last_peak_gb = round(peak, 2)
+        job.emit("done", {
+            "message_id": msg_id,
+            "cancelled": job.cancelled.is_set(),
+            "stats": {
+                "prompt_tokens": getattr(last, "prompt_tokens", 0) or 0,
+                "generation_tokens": getattr(last, "generation_tokens", None),
+                "prompt_tps": round(getattr(last, "prompt_tps", 0) or 0, 1),
+                "generation_tps": round(getattr(last, "generation_tps", 0) or 0, 1),
+                "peak_gb": self.last_peak_gb,
+                "wall_seconds": round(time.time() - t0, 1),
+            },
+        })
+
+    def _extract(self, job):
+        if job.payload.get("mode") == "read":
+            self._read_image(job)
+            return
+
+        image_path = job.payload["image_path"]
+        schema = job.payload["schema"]
+        passes = job.payload.get("passes", extract.DEFAULT_PASSES)
+
+        img = docvision.load_image(image_path)
+        job.emit("start", {
+            "mode": "extract",
+            "schema": schema.get("name", "schema"),
+            "image_size": list(img.size),
+        })
+
+        def on_progress(info):
+            job.emit("progress", info)
+
+        t0 = time.time()
+        try:
+            result = extract.extract_image(
+                self._image_reader(job), img, schema,
+                passes=passes, on_progress=on_progress,
+            )
+        except _Cancelled:
+            job.emit("cancelled", {})
+            return
+
+        flagged = [
+            i for i, rec in enumerate(result["records"])
+            if extract.worst_status(rec) != "ok"
+        ]
+        result["flagged_rows"] = flagged
+        if result.get("aborted"):
+            summary = f"추출 중단: {result['empty_reason']}"
+        else:
+            summary = (
+                f"{result['stats']['rows']}행 추출 "
+                f"(타일 {result['stats']['tiles']}개 × {passes}패스, "
+                f"모델 호출 {result['stats']['model_calls']}회). "
+                f"검토 필요 {len(flagged)}행."
+            )
+
+        msg_id = db_run(
+            "INSERT INTO messages (conversation_id, role, content, extraction, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (job.conversation_id, "assistant", summary,
+             json.dumps(result, ensure_ascii=False), time.time()),
+        )
+        db_run("UPDATE conversations SET updated_at=? WHERE id=?",
+               (time.time(), job.conversation_id))
+
+        job.emit("done", {
+            "message_id": msg_id,
+            "mode": "extract",
+            "extraction": result,
+            "stats": {
+                "peak_gb": self.last_peak_gb,
+                "wall_seconds": round(time.time() - t0, 1),
+                **result["stats"],
+            },
+        })
 
     def _generate(self, job):
         if job.cancelled.is_set():
@@ -616,10 +842,27 @@ def auth(body: AuthBody):
     return r
 
 
+def ui_version():
+    """Stamp identifying the UI assets currently on disk.
+
+    A tab opened before an edit keeps running the old code with no sign that
+    it is stale -- which is how a fixed bug went on showing "all rows passed"
+    for a zero-row result. The client compares this against the version it
+    booted with.
+    """
+    stamps = []
+    for asset in ("index.html", "app.js", "style.css"):
+        path = WEB_DIR / asset
+        if path.exists():
+            stamps.append(int(path.stat().st_mtime))
+    return max(stamps) if stamps else 0
+
+
 @app.get("/api/status")
 def status(_=Depends(require_auth)):
     info = engine.queue_info()
     return {
+        "ui_version": ui_version(),
         "model": engine.model_name,
         "max_context": engine.max_context,
         "hard_context_limit": HARD_CONTEXT_LIMIT,
@@ -661,12 +904,48 @@ def delete_conversation(cid: str, _=Depends(require_auth)):
 @app.get("/api/conversations/{cid}/messages")
 def get_messages(cid: str, _=Depends(require_auth)):
     rows = db_run(
-        "SELECT id, role, content, thinking, created_at FROM messages"
-        " WHERE conversation_id=? ORDER BY id",
+        "SELECT id, role, content, thinking, attachment, extraction, created_at"
+        " FROM messages WHERE conversation_id=? ORDER BY id",
         (cid,),
         fetch="all",
     )
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("extraction"):
+            d["extraction"] = json.loads(d["extraction"])
+        out.append(d)
+    return out
+
+
+@app.get("/api/schemas")
+def list_schemas(_=Depends(require_auth)):
+    """Extraction schemas available on disk."""
+    if not SCHEMA_DIR.exists():
+        return []
+    out = []
+    for path in sorted(SCHEMA_DIR.glob("*.json")):
+        try:
+            schema = extract.load_schema(path)
+        except (ValueError, json.JSONDecodeError):
+            continue  # a malformed schema should not break the picker
+        out.append({
+            "file": path.name,
+            "name": schema.get("name", path.stem),
+            "description": schema.get("description", ""),
+            "fields": extract.field_names(schema),
+        })
+    return out
+
+
+@app.get("/api/attachments/{name}")
+def get_attachment(name: str, _=Depends(require_auth)):
+    # The name comes from a URL, so anchor it to the upload directory rather
+    # than trusting it to stay inside.
+    path = (UPLOAD_DIR / name).resolve()
+    if not str(path).startswith(str(UPLOAD_DIR.resolve())) or not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path)
 
 
 _jobs: dict[str, Job] = {}
@@ -710,6 +989,90 @@ async def chat(body: ChatBody, request: Request, _=Depends(require_auth)):
     _evict_stale_jobs()
     _jobs[job.id] = job
     return {"job_id": job.id}
+
+
+@app.post("/api/extract")
+async def start_extraction(
+    request: Request,
+    file: UploadFile = File(...),
+    conversation_id: str = Form(...),
+    schema_file: str = Form(...),
+    passes: int = Form(extract.DEFAULT_PASSES),
+    question: str = Form(""),
+    _=Depends(require_auth),
+):
+    conv = db_run(
+        "SELECT id, title FROM conversations WHERE id=?", (conversation_id,), fetch="one"
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+    read_mode = schema_file == READ_MODE_SENTINEL
+    schema = None
+    if not read_mode:
+        schema_path = (SCHEMA_DIR / schema_file).resolve()
+        if not str(schema_path).startswith(str(SCHEMA_DIR.resolve())) or not schema_path.is_file():
+            raise HTTPException(status_code=404, detail="unknown schema")
+        try:
+            schema = extract.load_schema(schema_path)
+        except (ValueError, json.JSONDecodeError) as e:
+            raise HTTPException(status_code=400, detail=f"bad schema: {e}")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty upload")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"이미지가 너무 큽니다 ({len(raw)//1024//1024}MB, 최대 25MB)",
+        )
+
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    name = hashlib.sha256(raw).hexdigest()[:32] + ".png"
+    stored = UPLOAD_DIR / name
+    if not stored.exists():
+        try:
+            # Re-encode rather than trusting the extension: this both validates
+            # that the bytes really are an image and normalizes the format.
+            with PILImage.open(io.BytesIO(raw)) as im:
+                im.convert("RGB").save(stored, "PNG")
+        except Exception:
+            raise HTTPException(status_code=400, detail="이미지를 읽을 수 없습니다")
+
+    passes = max(1, min(5, passes))
+    question = (question or "").strip()
+    if read_mode:
+        label = f"[이미지 읽기] {question}" if question else "[이미지 읽기]"
+    else:
+        label = f"[이미지 추출] {schema.get('name', schema_file)}"
+    db_run(
+        "INSERT INTO messages (conversation_id, role, content, attachment, created_at)"
+        " VALUES (?,?,?,?,?)",
+        (conversation_id, "user", label, name, time.time()),
+    )
+    if conv["title"] == "새 채팅":
+        db_run("UPDATE conversations SET title=? WHERE id=?", (label[:40], conversation_id))
+
+    job = Job(
+        conversation_id,
+        asyncio.get_running_loop(),
+        kind="extract",
+        payload={
+            "image_path": str(stored),
+            "schema": schema,
+            "passes": passes,
+            "mode": "read" if read_mode else "extract",
+            "question": question,
+        },
+    )
+    if not engine.submit(job):
+        raise HTTPException(
+            status_code=503,
+            detail=f"queue is full ({MAX_QUEUE_DEPTH} waiting); try again shortly",
+        )
+    _evict_stale_jobs()
+    _jobs[job.id] = job
+    return {"job_id": job.id, "attachment": name}
 
 
 @app.post("/api/jobs/{job_id}/cancel")

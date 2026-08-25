@@ -5,3 +5,4 @@ conversations.db
 .model.lock
 bench_results.json
 limits_results.json
+uploads/
