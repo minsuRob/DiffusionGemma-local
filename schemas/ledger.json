@@ -1,0 +1,11 @@
+{
+  "name": "ledger",
+  "description": "거래 내역서: 코드/SKU/수량/금액 4열 표",
+  "row_key": "code",
+  "fields": [
+    { "name": "code",   "type": "string",  "pattern": "^INV-\\d{5}$" },
+    { "name": "sku",    "type": "string",  "pattern": "^[A-Z]{4}$" },
+    { "name": "qty",    "type": "integer", "min": 1, "max": 100000 },
+    { "name": "amount", "type": "number",  "min": 0 }
+  ]
+}
