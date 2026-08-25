@@ -1,0 +1,32 @@
+{
+  "ledger_20": {
+    "rows": 20,
+    "size": [
+      1920,
+      1080
+    ]
+  },
+  "ledger_45": {
+    "rows": 45,
+    "size": [
+      1920,
+      1080
+    ]
+  },
+  "ledger_shuffled": {
+    "rows": 24,
+    "size": [
+      1920,
+      1080
+    ],
+    "layout": [
+      "date",
+      "sku",
+      "amount",
+      "code",
+      "memo",
+      "qty"
+    ],
+    "header": true
+  }
+}
