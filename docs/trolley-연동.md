@@ -10,7 +10,7 @@ macOS 접근성 API(AXUIElement 트리)로 GUI 앱을 조작하는 Swift 도구�
 
 | | |
 | --- | --- |
-| 위치 | `/Users/markhub/Desktop/workspace/llm/trolley` |
+| 위치 | `/Users/markhub/Desktop/workspace/llm-trolley/trolley` |
 | 원격 | `github.com/minsuRob/trolley` |
 | 실행 | `trolley mcp` — stdio로 JSON-RPC 2.0(MCP)을 말하는 서버 |
 | 설치 경로 | `~/bin/trolley` (접근성 권한이 부여된 경로) |
