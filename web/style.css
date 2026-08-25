@@ -191,22 +191,73 @@ button { font: inherit; color: inherit; cursor: pointer; }
 }
 
 .msg-assistant { line-height: 1.75; word-break: break-word; }
+.msg-assistant > :first-child { margin-top: 0; }
+.msg-assistant > :last-child { margin-bottom: 0; }
 .msg-assistant p { margin: 0 0 12px; }
 .msg-assistant ul, .msg-assistant ol { margin: 0 0 12px; padding-left: 22px; }
 .msg-assistant li { margin-bottom: 5px; }
-.msg-assistant h1, .msg-assistant h2, .msg-assistant h3 {
-  font-size: 16px; font-weight: 600; margin: 18px 0 8px;
+.msg-assistant li > ul, .msg-assistant li > ol { margin: 5px 0 0; }
+.msg-assistant li > p { margin: 0 0 6px; }
+.msg-assistant li.task { list-style: none; margin-left: -20px; }
+.msg-assistant li.task input { margin: 0 7px 0 0; accent-color: var(--accent); }
+.msg-assistant h1, .msg-assistant h2, .msg-assistant h3,
+.msg-assistant h4, .msg-assistant h5, .msg-assistant h6 {
+  font-weight: 600; margin: 20px 0 8px; line-height: 1.4;
 }
+.msg-assistant h1 { font-size: 20px; }
+.msg-assistant h2 { font-size: 17px; }
+.msg-assistant h3 { font-size: 16px; }
+.msg-assistant h4, .msg-assistant h5, .msg-assistant h6 { font-size: 15px; }
+.msg-assistant h5, .msg-assistant h6 { color: var(--text-dim); }
+.msg-assistant a { color: var(--accent); text-decoration: none; }
+.msg-assistant a:hover { text-decoration: underline; }
+.msg-assistant del { color: var(--text-faint); }
+.msg-assistant hr {
+  border: 0; border-top: 1px solid var(--border); margin: 20px 0;
+}
+.msg-assistant blockquote {
+  margin: 0 0 12px; padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--border); color: var(--text-dim);
+}
+.msg-assistant blockquote > :last-child { margin-bottom: 0; }
 .msg-assistant code {
   background: var(--panel-2); padding: 2px 6px;
   border-radius: 6px; font-size: 13px;
   font-family: "SF Mono", Menlo, Consolas, monospace;
 }
 .msg-assistant pre {
+  position: relative;
   background: #0e0e0f; border: 1px solid var(--border);
   padding: 14px 16px; border-radius: 12px; overflow-x: auto; margin: 0 0 12px;
 }
 .msg-assistant pre code { background: none; padding: 0; font-size: 13px; line-height: 1.55; }
+/* The fence's language, parked in the corner rather than in a header bar that
+   would push the code down. */
+.msg-assistant pre code[data-lang]::before {
+  content: attr(data-lang);
+  position: absolute; top: 8px; right: 12px;
+  font-size: 11px; color: var(--text-faint); letter-spacing: .04em;
+}
+
+/* Tables scroll inside their own box: a wide one must not stretch the thread. */
+.table-wrap {
+  overflow-x: auto; margin: 0 0 14px;
+  border: 1px solid var(--border); border-radius: 12px;
+}
+.table-wrap::-webkit-scrollbar { height: 8px; }
+.table-wrap::-webkit-scrollbar-thumb { background: #3c4043; border-radius: 999px; }
+.msg-assistant table {
+  border-collapse: collapse; width: 100%; font-size: 14px;
+}
+.msg-assistant th, .msg-assistant td {
+  padding: 9px 14px; text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+.msg-assistant th + th, .msg-assistant td + td { border-left: 1px solid var(--border); }
+.msg-assistant thead th {
+  background: var(--panel-2); font-weight: 600; white-space: nowrap;
+}
+.msg-assistant tbody tr:last-child td { border-bottom: 0; }
 
 .thinking-toggle {
   display: inline-flex; align-items: center; gap: 6px;
@@ -220,6 +271,31 @@ button { font: inherit; color: inherit; cursor: pointer; }
   border-left: 2px solid var(--border); padding: 4px 0 4px 14px;
   margin: 4px 0 14px; color: var(--text-dim);
   font-size: 14px; white-space: pre-wrap; line-height: 1.7;
+}
+
+/* The canvas being denoised. Deliberately unlike settled text: this is a
+   draft that will be replaced, not prose that is being appended to. */
+.draft-canvas {
+  margin: 6px 0 2px;
+  padding: 12px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  background: rgba(168, 199, 250, .04);
+  color: var(--text-dim);
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px; line-height: 1.75;
+  white-space: pre-wrap; word-break: break-word;
+}
+.draft-canvas .mask {
+  color: var(--text-faint); opacity: .45;
+  animation: mask-pulse 1.4s ease-in-out infinite;
+}
+@keyframes mask-pulse {
+  0%, 100% { opacity: .45; }
+  50%      { opacity: .18; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .draft-canvas .mask { animation: none; }
 }
 
 .msg-actions { display: flex; gap: 4px; margin-top: 10px; }
