@@ -19,6 +19,7 @@ import atexit
 import json
 import os
 import queue
+import re
 import secrets
 import socket
 import sqlite3
@@ -36,9 +37,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from mlx_vlm import load, stream_generate
+from mlx_vlm import load
+from mlx_vlm.generate.diffusion import stream_diffusion_generate_from_kwargs
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.utils import load_config
+from mlx_vlm.utils import load_config, prepare_inputs, should_add_special_tokens
 
 from context_guard import (
     HARD_CONTEXT_LIMIT,
@@ -134,6 +136,20 @@ class ChannelSplitter:
         return out
 
 
+# A denoising snapshot is a picture of the whole canvas, not a position in a
+# stream, so ChannelSplitter cannot be used on it. Markers are only stripped so
+# the preview reads as text; which side of a marker a word falls on does not
+# matter for a frame that is about to be replaced.
+_CHANNEL_MARKER_RE = re.compile(
+    f"{re.escape(THOUGHT_START)}[^\n]*\n?|{re.escape(THOUGHT_END)}"
+)
+
+
+def strip_channel_markers(text):
+    """Drop thinking-channel markers from a whole-canvas snapshot."""
+    return _CHANNEL_MARKER_RE.sub("", text)
+
+
 # ---------------------------------------------------------------------------
 # database
 # ---------------------------------------------------------------------------
@@ -205,11 +221,21 @@ class Job:
 class Engine:
     """Owns the model and the single worker thread that may touch it."""
 
-    def __init__(self, model_name, max_context, max_tokens, temperature):
+    def __init__(
+        self,
+        model_name,
+        max_context,
+        max_tokens,
+        temperature,
+        canvas_length=None,
+        unmasking_interval=2,
+    ):
         self.model_name = model_name
         self.max_context = max_context
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.canvas_length = canvas_length
+        self.unmasking_interval = unmasking_interval
         self.jobs = queue.Queue()
         self.pending = []  # jobs waiting, for queue-position reporting
         self.pending_lock = threading.Lock()
@@ -268,6 +294,51 @@ class Engine:
                 mx.clear_cache()
                 self.total_jobs += 1
 
+    def _diffusion_stream(self, prompt, on_result):
+        """Drive the diffusion denoiser, pushing every result to `on_result`.
+
+        Not stream_generate(): on the diffusion path it collects every result
+        into a list and only yields once generation has finished, so the whole
+        answer lands at once and cancellation cannot be seen mid-generation.
+        Live delivery needs the on_result callback, and that cannot be passed
+        through stream_generate either -- it forwards **kwargs into a call that
+        already binds on_result, which raises TypeError. So prepare the inputs
+        the way stream_generate would and call the diffusion entry point
+        directly, as mlx-vlm's own server does.
+
+        Returns the generator; the caller must exhaust and close it.
+        """
+        inputs = prepare_inputs(
+            self.processor,
+            prompts=prompt,
+            add_special_tokens=should_add_special_tokens(
+                self.model.config.model_type, self.processor
+            ),
+        )
+
+        stream_kwargs = {
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "prefill_step_size": PREFILL_STEP_SIZE,
+        }
+        if self.canvas_length:
+            stream_kwargs["diffusion_max_canvas_length"] = self.canvas_length
+        if self.unmasking_interval:
+            stream_kwargs["diffusion_show_unmasking"] = True
+            stream_kwargs["diffusion_unmasking_interval"] = self.unmasking_interval
+
+        return stream_diffusion_generate_from_kwargs(
+            self.model,
+            self.processor,
+            self.tokenizer,
+            inputs["input_ids"],
+            None,  # pixel_values; this server is text-only
+            inputs.get("attention_mask"),
+            [],  # skip_special_token_ids
+            stream_kwargs,
+            on_result=on_result,
+        )
+
     def _generate(self, job):
         if job.cancelled.is_set():
             job.emit("error", {"message": "cancelled before start"})
@@ -310,20 +381,33 @@ class Engine:
         last = None
         t0 = time.time()
 
-        for result in stream_generate(
-            self.model,
-            self.processor,
-            prompt,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            prefill_step_size=PREFILL_STEP_SIZE,
-        ):
+        def on_result(result):
+            nonlocal last
             if job.cancelled.is_set():
-                break
+                return False  # stops the denoiser at the next step
+            if result.is_draft:
+                job.emit(
+                    "draft",
+                    {
+                        "text": strip_channel_markers(result.draft_text),
+                        "step": result.diffusion_step,
+                        "total": result.diffusion_total_steps,
+                        "canvas": result.diffusion_canvas_index,
+                    },
+                )
+                return True
             last = result
             for kind, text in splitter.feed(result.text):
                 (thinking if kind == "thinking" else answer).append(text)
                 job.emit("token", {"kind": kind, "text": text})
+            return True
+
+        results = self._diffusion_stream(prompt, on_result)
+        try:
+            for _ in results:  # with on_result set, nothing is ever yielded
+                pass
+        finally:
+            results.close()
 
         for kind, text in splitter.flush():
             (thinking if kind == "thinking" else answer).append(text)
@@ -691,6 +775,20 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
+        "--canvas-length",
+        type=int,
+        default=None,
+        help="tokens denoised per canvas; smaller commits text more often but "
+        "costs throughput (default: the model's own canvas_length)",
+    )
+    parser.add_argument(
+        "--unmasking-interval",
+        type=int,
+        default=2,
+        help="send a denoising preview every Nth step; 0 disables the preview "
+        "(each frame forces a GPU sync, so lower is smoother but slower)",
+    )
+    parser.add_argument(
         "--token",
         default=os.environ.get("DIFFUSIONGEMMA_TOKEN"),
         help="access token; generated if omitted",
@@ -708,7 +806,14 @@ def main():
 
     init_db()
 
-    engine = Engine(args.model, max_context, args.max_tokens, args.temperature)
+    engine = Engine(
+        args.model,
+        max_context,
+        args.max_tokens,
+        args.temperature,
+        canvas_length=args.canvas_length,
+        unmasking_interval=max(0, args.unmasking_interval),
+    )
     print(f"Loading {args.model} ...", flush=True)
     took = engine.load()
     engine.start()
