@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DiffusionGemma</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div id="auth-gate" class="auth-gate hidden">
+  <div class="auth-card">
+    <h1>DiffusionGemma</h1>
+    <p>이 서버는 액세스 토큰이 필요합니다.</p>
+    <input id="auth-input" type="password" placeholder="액세스 토큰" autocomplete="off">
+    <button id="auth-submit">접속</button>
+    <p id="auth-error" class="auth-error"></p>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+  <div class="backdrop" id="backdrop"></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <button class="icon-btn" id="sidebar-toggle" title="사이드바 접기">☰</button>
+    </div>
+
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input id="search" type="search" placeholder="검색" autocomplete="off">
+    </div>
+
+    <button class="nav-item" id="new-chat">
+      <span class="nav-icon">✎</span><span>새 채팅</span>
+    </button>
+
+    <div class="section-label">채팅</div>
+    <div class="conv-list" id="conv-list"></div>
+
+    <div class="sidebar-foot">
+      <div class="avatar">D</div>
+      <div class="who">
+        <div class="who-name">로컬 세션</div>
+        <div class="who-sub" id="engine-sub">연결 중…</div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="sidebar-open" title="사이드바 열기">☰</button>
+      <div class="topbar-title" id="topbar-title">새 채팅</div>
+      <div class="queue-chip hidden" id="queue-chip"></div>
+    </header>
+
+    <div class="thread" id="thread">
+      <div class="empty-state" id="empty-state">
+        <h2>무엇을 도와드릴까요?</h2>
+        <p>DiffusionGemma 26B가 이 기기에서 로컬로 실행 중입니다.</p>
+      </div>
+    </div>
+
+    <div class="composer-wrap">
+      <div class="composer">
+        <button class="icon-btn composer-plus" title="첨부 (미지원)" disabled>＋</button>
+        <textarea id="input" rows="1" placeholder="DiffusionGemma에게 물어보기"></textarea>
+        <button class="send-btn" id="send" title="보내기">↑</button>
+        <button class="send-btn stop hidden" id="stop" title="중지">■</button>
+      </div>
+      <div class="disclaimer" id="disclaimer">
+        로컬 모델이며 실수를 할 수 있습니다.
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
