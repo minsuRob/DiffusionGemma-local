@@ -11,6 +11,9 @@ const state = {
   filter: "",
   attachment: null, // {file, url} while an image is staged for extraction
   schemas: [],
+  backends: [],     // every configured backend, including unusable ones
+  backendId: null,  // the one this conversation is pointed at
+  defaultBackend: null,
   uiVersion: null,  // asset stamp this tab booted with
   uiStale: false,
 };
@@ -70,6 +73,8 @@ async function boot() {
     await refreshStatus();
     $("auth-gate").classList.add("hidden");
     $("app").classList.remove("hidden");
+    await loadBackends();
+    await refreshStatus();  // now that the picker knows which backend is live
     await loadSchemas();
     await loadConversations();
   } catch (_) {
@@ -123,11 +128,85 @@ function checkUiVersion(version) {
 async function refreshStatus() {
   const s = await api("/api/status");
   checkUiVersion(s.ui_version);
-  const peak = s.last_peak_gb ? `, 최근 피크 ${s.last_peak_gb}GB` : "";
-  $("engine-sub").textContent =
-    `컨텍스트 ${(s.max_context / 1000).toFixed(0)}K${peak}`;
+  state.defaultBackend = s.default_backend;
+  const b = currentBackend();
+  if (b && b.remote) {
+    // Nothing runs on this machine for a remote backend, so peak memory and
+    // the local context budget would both be describing the wrong model.
+    $("engine-sub").textContent = `${b.label} · 원격`;
+  } else if (s.max_context) {
+    const peak = s.last_peak_gb ? `, 최근 피크 ${s.last_peak_gb}GB` : "";
+    $("engine-sub").textContent =
+      `컨텍스트 ${(s.max_context / 1000).toFixed(0)}K${peak}`;
+  } else {
+    $("engine-sub").textContent = b ? b.label : "연결됨";
+  }
   updateQueueChip(s);
   return s;
+}
+
+/* -------------------------------------------------------------- backends */
+
+function currentBackend() {
+  const id = state.backendId || state.defaultBackend;
+  return state.backends.find((b) => b.id === id) || null;
+}
+
+function knownBackend(id) {
+  return id && state.backends.some((b) => b.id === id) ? id : null;
+}
+
+async function loadBackends() {
+  state.backends = await api("/api/backends");
+  const def = state.backends.find((b) => b.default);
+  if (def) state.defaultBackend = def.id;
+  renderBackendPicker();
+}
+
+function renderBackendPicker() {
+  const sel = $("backend-select");
+  sel.innerHTML = "";
+  for (const b of state.backends) {
+    const opt = document.createElement("option");
+    opt.value = b.id;
+    opt.textContent = b.available ? b.label : `${b.label} (사용 불가)`;
+    // Kept in the list rather than hidden: a missing API key is worth seeing
+    // and explaining, not silently pretending the backend does not exist.
+    opt.disabled = !b.available;
+    if (b.reason) opt.title = b.reason;
+    sel.append(opt);
+  }
+  sel.value = state.backendId || state.defaultBackend || "";
+  applyBackendCapabilities();
+}
+
+function applyBackendCapabilities() {
+  const b = currentBackend();
+  const canSee = !b || b.capabilities.vision;
+  const attach = $("attach-btn");
+  attach.disabled = !canSee;
+  attach.title = canSee ? "이미지 첨부" : `${b.label}는 이미지를 읽을 수 없습니다`;
+  if (!canSee && state.attachment) clearAttachment();
+  const sub = $("empty-sub");
+  if (sub && b) {
+    sub.textContent = b.remote
+      ? `${b.label}에 연결되어 있습니다.`
+      : `${b.label}가 이 기기에서 실행 중입니다.`;
+  }
+  if (typeof fitPlaceholder === "function") fitPlaceholder();
+}
+
+async function setBackend(id, { persist = true } = {}) {
+  state.backendId = id;
+  $("backend-select").value = id;
+  applyBackendCapabilities();
+  if (persist && state.activeId) {
+    await api(`/api/conversations/${state.activeId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ backend: id }),
+    }).catch(() => {});
+  }
+  refreshStatus().catch(() => {});
 }
 
 function updateQueueChip({ waiting, busy }) {
@@ -191,7 +270,7 @@ function renderSidebar() {
 async function newConversation() {
   const conv = await api("/api/conversations", {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify({ backend: state.backendId || state.defaultBackend }),
   });
   state.conversations.unshift(conv);
   state.activeId = conv.id;
@@ -213,6 +292,12 @@ async function openConversation(id, { fromBoot = false } = {}) {
   state.activeId = id;
   const conv = state.conversations.find((c) => c.id === id);
   $("topbar-title").textContent = conv ? conv.title : "채팅";
+  // A conversation remembers its backend; null means the server default. So
+  // does an id that models.json no longer lists -- the server resolves that
+  // the same way, and leaving the picker blank would misreport what will run.
+  state.backendId = knownBackend(conv && conv.backend) || state.defaultBackend;
+  $("backend-select").value = state.backendId || "";
+  applyBackendCapabilities();
   renderSidebar();
 
   const messages = await api(`/api/conversations/${id}/messages`);
@@ -243,9 +328,25 @@ async function openConversation(id, { fromBoot = false } = {}) {
 function showEmptyState() {
   const el = document.createElement("div");
   el.className = "empty-state";
-  el.innerHTML =
-    "<h2>무엇을 도와드릴까요?</h2><p>DiffusionGemma 26B가 이 기기에서 로컬로 실행 중입니다.</p>";
+  const b = currentBackend();
+  const sub = !b
+    ? "모델을 확인하는 중…"
+    : b.remote
+      ? `${b.label}에 연결되어 있습니다.`
+      : `${b.label}가 이 기기에서 실행 중입니다.`;
+  const h = document.createElement("h2");
+  h.textContent = "무엇을 도와드릴까요?";
+  const p = document.createElement("p");
+  p.id = "empty-sub";
+  p.textContent = sub;
+  el.append(h, p);
   $("thread").append(el);
+}
+
+function backendLabel(id) {
+  if (!id) return "";
+  const b = state.backends.find((x) => x.id === id);
+  return b ? b.label : id;
 }
 
 /* -------------------------------------------------------------- markdown */
@@ -1010,6 +1111,7 @@ async function sendExtraction() {
   const form = new FormData();
   form.append("file", file);
   form.append("conversation_id", state.activeId);
+  if (state.backendId) form.append("backend_id", state.backendId);
   form.append("schema_file", schemaFile);
   form.append("passes", $("passes-select").value);
   if (isRead && question) form.append("question", question);
@@ -1089,7 +1191,11 @@ async function send() {
   try {
     const r = await api("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ conversation_id: state.activeId, content }),
+      body: JSON.stringify({
+        conversation_id: state.activeId,
+        content,
+        backend: state.backendId || undefined,
+      }),
     });
     jobId = r.job_id;
   } catch (e) {
@@ -1179,9 +1285,11 @@ function streamJob(jobId, pendingNotice) {
     pendingNotice.innerHTML =
       `<span class="dots"><span></span><span></span><span></span></span>`;
     if (d.dropped_turns > 0) {
+      const budget = d.prompt_tokens != null
+        ? `컨텍스트 예산(${d.prompt_tokens.toLocaleString()} 토큰)`
+        : "컨텍스트 예산";
       notice(
-        `컨텍스트 예산(${d.prompt_tokens.toLocaleString()} 토큰)에 맞추기 위해 ` +
-          `오래된 대화 ${d.dropped_turns}턴을 제외했습니다.`
+        `${budget}에 맞추기 위해 오래된 대화 ${d.dropped_turns}턴을 제외했습니다.`
       );
     }
   });
@@ -1254,14 +1362,18 @@ function streamJob(jobId, pendingNotice) {
     if (n.thinkingBody) n.thinkingBody.textContent = thinkingRaw;
     n.turn.append(buildActions(answerRaw));
 
-    const s = d.stats;
+    const s = d.stats || {};
     const line = document.createElement("div");
     line.className = "stats-line";
-    line.textContent =
-      `ctx ${s.prompt_tokens.toLocaleString()} tok · ` +
-      `생성 ${s.generation_tokens ?? "?"} tok · ` +
-      `${s.generation_tps} tok/s · ${s.wall_seconds}s` +
-      (s.peak_gb ? ` · 피크 ${s.peak_gb}GB` : "");
+    const bits = [];
+    if (s.prompt_tokens != null) bits.push(`ctx ${s.prompt_tokens.toLocaleString()} tok`);
+    bits.push(`생성 ${s.generation_tokens ?? "?"} tok`);
+    if (s.generation_tps != null) bits.push(`${s.generation_tps} tok/s`);
+    bits.push(`${s.wall_seconds}s`);
+    if (s.peak_gb) bits.push(`피크 ${s.peak_gb}GB`);
+    const label = backendLabel(d.backend);
+    if (label) bits.push(label);
+    line.textContent = bits.join(" · ");
     n.turn.append(line);
 
     finish(src, pendingNotice);
@@ -1307,6 +1419,7 @@ function setStreaming(on) {
 /* ----------------------------------------------------------------- events */
 
 $("send").onclick = send;
+$("backend-select").onchange = (e) => setBackend(e.target.value);
 $("attach-btn").onclick = () => $("file-input").click();
 $("file-input").onchange = (e) => setAttachment(e.target.files[0]);
 $("attach-clear").onclick = clearAttachment;
@@ -1377,8 +1490,10 @@ const input = $("input");
 // pick the wording to fit the width rather than relying on CSS ellipsis
 // (which browsers do not apply to textarea placeholders).
 function fitPlaceholder() {
+  const b = currentBackend();
   input.placeholder =
-    input.clientWidth < 320 ? "메시지 입력" : "DiffusionGemma에게 물어보기";
+    input.clientWidth < 320 ? "메시지 입력"
+      : b ? `${b.label}에게 물어보기` : "무엇이든 물어보기";
 }
 fitPlaceholder();
 window.addEventListener("resize", fitPlaceholder);

@@ -50,13 +50,14 @@
     <header class="topbar">
       <button class="icon-btn only-mobile" id="sidebar-open" title="사이드바 열기">☰</button>
       <div class="topbar-title" id="topbar-title">새 채팅</div>
+      <select class="backend-select" id="backend-select" title="모델 선택"></select>
       <div class="queue-chip hidden" id="queue-chip"></div>
     </header>
 
     <div class="thread" id="thread">
       <div class="empty-state" id="empty-state">
         <h2>무엇을 도와드릴까요?</h2>
-        <p>DiffusionGemma 26B가 이 기기에서 로컬로 실행 중입니다.</p>
+        <p id="empty-sub">모델을 확인하는 중…</p>
       </div>
     </div>
 
@@ -82,12 +83,12 @@
       <div class="composer">
         <button class="icon-btn composer-plus" id="attach-btn" title="이미지 첨부">＋</button>
         <input type="file" id="file-input" accept="image/*" hidden>
-        <textarea id="input" rows="1" placeholder="DiffusionGemma에게 물어보기"></textarea>
+        <textarea id="input" rows="1" placeholder="무엇이든 물어보기"></textarea>
         <button class="send-btn" id="send" title="보내기">↑</button>
         <button class="send-btn stop hidden" id="stop" title="중지">■</button>
       </div>
       <div class="disclaimer" id="disclaimer">
-        로컬 모델이며 실수를 할 수 있습니다.
+        모델은 실수를 할 수 있습니다.
       </div>
     </div>
   </main>
