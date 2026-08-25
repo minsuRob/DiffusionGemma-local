@@ -1,0 +1,30 @@
+{
+  "_comment": "Backends the server offers. API keys are read from the environment, never from this file, so it is safe to commit. Adding a backend needs a matching class in backends.py KINDS.",
+  "default": "local-diffusiongemma",
+  "backends": [
+    {
+      "id": "local-diffusiongemma",
+      "kind": "mlx-local",
+      "label": "DiffusionGemma 26B (로컬)",
+      "model": "mlx-community/diffusiongemma-26B-A4B-it-4bit"
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "kind": "gemini",
+      "label": "Gemini 2.5 Flash",
+      "model": "gemini-2.5-flash",
+      "api_key_env": "GEMINI_API_KEY",
+      "context_limit": 1000000,
+      "max_tokens": 8192
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "kind": "gemini",
+      "label": "Gemini 2.5 Pro",
+      "model": "gemini-2.5-pro",
+      "api_key_env": "GEMINI_API_KEY",
+      "context_limit": 1000000,
+      "max_tokens": 8192
+    }
+  ]
+}
