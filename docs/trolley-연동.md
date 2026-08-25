@@ -22,7 +22,8 @@ trolley 프로젝트 스코프).
 ### 툴 표면
 
 `check_permissions`, `list_apps`, `launch_app`, `snapshot`, `find_elements`,
-`click`, `focus`, `type_text`, `press_key`, `set_ax_value`, `wait_for_element`.
+`click`, `focus`, `type_text`, `press_key`, `set_ax_value`, `wait_for_element`,
+`screenshot`, `click_at`, `move_mouse`.
 
 `snapshot`이 AX 트리를 LLM이 읽기 좋은 JSON으로 주고 노드마다 `e1`, `e2` 같은 ID를
 붙인다. 이후 동작 툴은 그 ID로 요소를 지목한다. 서버가 살아 있는 동안 ID가 유지되므로
@@ -74,10 +75,13 @@ README에 적힌 대로 `server.py` 대신 `python -m mlx_vlm.server --port 8080
   값을 보고하지 않아 흔히 나온다. 시스템 프롬프트에서 모델에게 이를 성공으로 해석하지
   말라고 명시해야 한다. 같은 이유로 trolley는 자동 재시도를 하지 않는다 — 검증 불가 상태에서
   재시도하면 텍스트가 두 번 들어갈 수 있기 때문이다.
-- **Chromium/Electron 웹 콘텐츠는 AX 트리가 안 열리는 경우가 있다.** `thorough=true`로도
-  안 되면 그 영역은 AX 방식의 구조적 한계다. 우리에게는 오히려 기회다 — 이 저장소는 이미
-  이미지를 읽는 모델을 갖고 있으므로, 네이티브 UI는 trolley의 AX로, 웹 콘텐츠는
-  스크린샷 + DiffusionGemma의 비전으로 처리하는 하이브리드가 자연스럽다.
+- **Chromium/Electron 웹 콘텐츠는 하이브리드로 처리된다.** `thorough=true`로도 AX 트리가
+  안 열리면 trolley의 `screenshot`(MCP 이미지 블록, 1픽셀=1포인트 정규화)과
+  `click_at`(이지징 커서 애니메이션 포함)으로 전환한다 — 빈 snapshot의 hint가 이 전환을
+  직접 안내한다. 비전은 MCP 클라이언트가 맡는다. **이 저장소의 모델을 그 비전으로 쓰는
+  것은 보류됐다**: 이미지가 224×224로 축소돼 화면 읽기에 해상도가 부족하기 때문이다.
+  연동한다면 클라이언트 쪽 에이전트 루프에서 trolley의 스크린샷을 그대로 전달받는 구조가
+  되어야 하고, 그 경우에도 화면 판독은 타일 분할 없이는 어렵다.
 
 ## 반대 방향
 
