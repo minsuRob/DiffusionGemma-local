@@ -22,17 +22,91 @@ python3 -m venv .venv
 .venv/bin/python server.py
 ```
 
-실행하면 액세스 토큰이 포함된 LAN URL을 출력한다. 같은 네트워크의 폰·태블릿·다른 맥에서
-그 주소를 열면 바로 쓸 수 있다.
+기본 동작은 이렇다. 로컬 DiffusionGemma를 로드하고, Tailscale Funnel로 `:8443`을
+열고, 인증 없이(URL을 아는 사람은 누구나) 접속을 받는다.
 
 ```
-Open on any device on this network:
-  http://192.168.0.10:8842/?token=Xc9f...
+Loaded in 3.2s.
+  context budget : 96,000 tokens (~21.4GB peak)
+  remote lane    : up to 4 concurrent, not queued
+  * local-diffusiongemma  DiffusionGemma 26B (로컬)
+    gemini-2.5-flash      Gemini 2.5 Flash  — 사용 불가: GEMINI_API_KEY 환경변수가 없습니다
+  auth           : open
+
+Reachable from the public internet:
+  https://your-machine.tailnet.ts.net:8443/
+
+On this network:
+  http://192.168.0.10:8842/
 ```
 
 주요 옵션: `--port` (기본 8842), `--host`, `--max-context` (기본 96,000),
-`--max-tokens` (기본 1024), `--token` (고정 토큰; 생략 시 매 실행마다 랜덤 발급).
-`DIFFUSIONGEMMA_TOKEN` 환경변수로도 지정할 수 있다.
+`--max-tokens` (기본 1024), `--models` (기본 `models.json`),
+`--no-local` (원격 백엔드만; MLX를 로드하지 않는다).
+
+## 백엔드 — 무엇으로 답하게 할 것인가
+
+`models.json`이 선택지를 정한다. 기본값은 `local-diffusiongemma`, 즉 지금까지와
+똑같이 이 기기에서 도는 모델이다. 대화마다 상단바에서 바꿀 수 있고, 선택은 그
+대화에 저장된다.
+
+```json
+{
+  "default": "local-diffusiongemma",
+  "backends": [
+    { "id": "local-diffusiongemma", "kind": "mlx-local",
+      "model": "mlx-community/diffusiongemma-26B-A4B-it-4bit" },
+    { "id": "gemini-2.5-flash", "kind": "gemini", "model": "gemini-2.5-flash",
+      "api_key_env": "GEMINI_API_KEY" }
+  ]
+}
+```
+
+API 키는 이 파일이 아니라 환경변수에서 읽는다. 키가 없는 백엔드는 목록에서 사라지지
+않고 "사용 불가"로 남아 이유를 말한다 — 보내고 나서 실패하는 것보다 낫다.
+
+```bash
+GEMINI_API_KEY=... .venv/bin/python server.py
+```
+
+**로컬만 줄을 선다.** 단일 워커 대기열은 이 기기의 메모리를 지키려고 있는 것이므로,
+원격 백엔드에는 적용하지 않는다. 로컬 생성이 30초째 돌고 있어도 Gemini 대화는 즉시
+시작된다(동시 4건까지). 백엔드가 이미지를 못 읽으면 첨부 버튼이 잠기고, 디노이징
+미리보기(`draft`)는 로컬 백엔드에만 있는 기능이다.
+
+새 백엔드를 붙이려면 `backends.py`에 `stream_chat` / `image_reader` /
+`stream_read_image`를 가진 클래스 하나를 더하고 `KINDS`에 등록하면 된다.
+`server.py`는 건드릴 필요가 없다.
+
+## 외부 접근 (Tailscale)
+
+| 값 | 의미 |
+| --- | --- |
+| `--expose funnel` (기본) | 인터넷 어디서나 `https://<호스트>:8443/` |
+| `--expose serve` | 같은 테일넷 안에서만 HTTPS |
+| `--expose off` | LAN 바인딩만 |
+
+`--expose-port`는 기본 8443이다. Funnel이 허용하는 포트는 443·8443·10000뿐이고,
+443을 이미 다른 서비스가 쓰고 있어도 8443은 그 매핑을 건드리지 않는다. 서버가
+종료되면 매핑도 철회된다. tailscale이 없거나 실패하면 경고만 남기고 LAN으로 계속 뜬다.
+
+### 인증
+
+`--auth open`이 기본이다. 게이트가 없고, URL을 아는 것이 곧 접근 권한이다.
+
+**Funnel과 함께 쓸 때 이게 무엇을 뜻하는지는 분명히 알아두는 게 좋다.** `*.ts.net`
+호스트명은 Tailscale이 인증서를 발급하는 순간 공개 Certificate Transparency 로그에
+올라간다. 즉 주소는 비밀이 아니라 **찾을 수 있는 것**이다. 무인증 + Funnel이면 그
+주소에 닿은 사람은 누구나 모든 대화 기록과 업로드한 이미지를 읽고 모델을 쓸 수 있다.
+
+자리를 비운 채 띄워둘 거라면 둘 중 하나를 택한다.
+
+```bash
+.venv/bin/python server.py --auth token      # 랜덤 토큰 → 쿠키 게이트
+.venv/bin/python server.py --expose serve    # 테일넷 안에서만
+```
+
+`--token`(또는 `DIFFUSIONGEMMA_TOKEN`)으로 고정 토큰을 주면 `--auth token`이 자동으로 켜진다.
 
 diffusion 관련 옵션 둘:
 
@@ -76,9 +150,9 @@ diffusion 관련 옵션 둘:
 
 | 장치 | 동작 |
 |---|---|
-| 단일 워커 직렬화 | 생성은 언제나 한 번에 하나. 나머지는 큐에서 대기하며 순번을 SSE로 받는다 |
+| 단일 워커 직렬화 | **로컬 백엔드의** 생성은 언제나 한 번에 하나. 나머지는 큐에서 대기하며 순번을 SSE로 받는다. 원격 백엔드는 이 기기의 메모리를 쓰지 않으므로 이 줄에 서지 않는다 |
 | 대기열 상한 8 | 초과 요청은 503으로 즉시 거부 (무한 적체 방지) |
-| 중복 실행 차단 | PID 락파일 + `mlx_vlm.server` 프로세스 스캔. 두 인스턴스는 ~34GB라 하드 스톱 |
+| 중복 실행 차단 | PID 락파일 + `mlx_vlm.server` 프로세스 스캔. 두 인스턴스는 ~34GB라 하드 스톱. `--no-local`이면 모델을 안 잡으므로 락도 잡지 않는다 |
 | 포트 사전 점검 | 모델 로드(3초) 전에 바인드 가능 여부를 먼저 확인 |
 | 컨텍스트 예산 | 기본 96K, 하드 상한 120K. 초과 시 오래된 턴부터 자동 제외 |
 | 청크 프리필 | `prefill_step_size=2048`. 없으면 ~16K에서 Metal 버퍼 한계로 OOM |
@@ -244,7 +318,9 @@ sudo sysctl iogpu.wired_limit_mb=30720
 
 | 파일 | 역할 |
 |---|---|
-| [server.py](server.py) | SSE 서버, 단일 워커 큐, SQLite, 토큰 인증 |
+| [server.py](server.py) | SSE 서버, 잡 러너, 로컬/원격 두 레인, SQLite, 인증, Tailscale 노출 |
+| [backends.py](backends.py) | 백엔드 추상화와 구현 (로컬 MLX, Gemini), 사고 채널 분리 |
+| [models.json](models.json) | 어떤 백엔드를 고를 수 있는지 |
 | [web/](web/) | 채팅 UI (`index.html`, `style.css`, `app.js`) |
 | [context_guard.py](context_guard.py) | 컨텍스트 상한·히스토리 트리밍 (CLI/서버 공용) |
 | [chat.py](chat.py) | 터미널 채팅 |
