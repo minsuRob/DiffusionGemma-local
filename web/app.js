@@ -9,6 +9,10 @@ const state = {
   source: null,
   streaming: false,
   filter: "",
+  attachment: null, // {file, url} while an image is staged for extraction
+  schemas: [],
+  uiVersion: null,  // asset stamp this tab booted with
+  uiStale: false,
 };
 
 /* ------------------------------------------------------------------ auth */
@@ -66,6 +70,7 @@ async function boot() {
     await refreshStatus();
     $("auth-gate").classList.add("hidden");
     $("app").classList.remove("hidden");
+    await loadSchemas();
     await loadConversations();
   } catch (_) {
     showAuthGate();
@@ -87,8 +92,37 @@ $("auth-input").addEventListener("keydown", (e) => {
 
 /* ---------------------------------------------------------------- status */
 
+function checkUiVersion(version) {
+  if (!version) return;
+  if (state.uiVersion === null) {
+    state.uiVersion = version; // first status call after boot
+    return;
+  }
+  if (version === state.uiVersion || state.uiStale) return;
+  state.uiStale = true;
+
+  // Reloading is safe only when nothing would be lost. Otherwise say so and
+  // let the user pick the moment -- but never keep quiet, because stale code
+  // renders confidently wrong results.
+  const busy =
+    state.streaming || state.attachment || $("input").value.trim().length > 0;
+  if (!busy) {
+    location.reload();
+    return;
+  }
+  const bar = document.createElement("div");
+  bar.className = "update-bar";
+  bar.innerHTML = "<span>UI가 업데이트되었습니다. 지금 화면은 이전 버전입니다.</span>";
+  const btn = document.createElement("button");
+  btn.textContent = "새로고침";
+  btn.onclick = () => location.reload();
+  bar.append(btn);
+  document.querySelector(".main").prepend(bar);
+}
+
 async function refreshStatus() {
   const s = await api("/api/status");
+  checkUiVersion(s.ui_version);
   const peak = s.last_peak_gb ? `, 최근 피크 ${s.last_peak_gb}GB` : "";
   $("engine-sub").textContent =
     `컨텍스트 ${(s.max_context / 1000).toFixed(0)}K${peak}`;
@@ -172,6 +206,9 @@ async function newConversation() {
 
 const isNarrow = () => window.matchMedia("(max-width: 720px)").matches;
 
+// Must match READ_MODE_SENTINEL in server.py.
+const READ_MODE = "__read__";
+
 async function openConversation(id, { fromBoot = false } = {}) {
   state.activeId = id;
   const conv = state.conversations.find((c) => c.id === id);
@@ -186,8 +223,16 @@ async function openConversation(id, { fromBoot = false } = {}) {
     return;
   }
   for (const m of messages) {
-    if (m.role === "user") appendUser(m.content);
-    else appendAssistant(m.content, m.thinking);
+    if (m.role === "user") {
+      appendUser(m.content, m.attachment);
+    } else if (m.extraction) {
+      const turn = document.createElement("div");
+      turn.className = "turn";
+      turn.append(renderExtraction(m.extraction));
+      thread.append(turn);
+    } else {
+      appendAssistant(m.content, m.thinking);
+    }
   }
   scrollToBottom();
   // Picking a conversation on a phone should reveal it, not leave the drawer
@@ -528,16 +573,291 @@ function renderMarkdown(src) {
 
 /* --------------------------------------------------------- message nodes */
 
-function appendUser(text) {
+function appendUser(text, attachment) {
   clearEmptyState();
   const turn = document.createElement("div");
   turn.className = "turn msg-user";
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = text;
+  if (attachment) {
+    const img = document.createElement("img");
+    img.className = "bubble-thumb";
+    img.src = attachment.startsWith("blob:") || attachment.startsWith("data:")
+      ? attachment
+      : `/api/attachments/${attachment}`;
+    img.alt = "첨부 이미지";
+    bubble.append(img);
+  }
+  const label = document.createElement("div");
+  label.textContent = text;
+  bubble.append(label);
   turn.append(bubble);
   $("thread").append(turn);
   return turn;
+}
+
+/* ------------------------------------------------------ extraction result */
+
+function buildDisclosure(openLabel, closeLabel, text) {
+  const toggle = document.createElement("button");
+  toggle.className = "thinking-toggle";
+  toggle.innerHTML = `<span>${openLabel}</span><span class="caret">⌄</span>`;
+  const body = document.createElement("div");
+  body.className = "thinking-body hidden";
+  body.textContent = text;
+  toggle.onclick = () => {
+    const open = body.classList.toggle("hidden") === false;
+    toggle.classList.toggle("open", open);
+    toggle.firstChild.textContent = open ? closeLabel : openLabel;
+  };
+  return { toggle, body };
+}
+
+const STATUS_LABEL = {
+  ok: "3패스 일치",
+  majority: "다수결로 채택 — 확인 권장",
+  resolved: "재판독으로 확정",
+  conflict: "패스마다 다름",
+  unresolved: "확정 실패 — 직접 확인 필요",
+  invalid: "형식 규칙 위반",
+  missing: "값 없음",
+};
+
+function renderExtraction(result) {
+  const wrap = document.createElement("div");
+  wrap.className = "extraction";
+
+  const s = result.stats || {};
+  const flagged = (result.flagged_rows || []).length;
+
+  const head = document.createElement("div");
+  head.className = "extract-head";
+  head.innerHTML =
+    `<strong>${s.rows ?? 0}행</strong> 추출 · 타일 ${s.tiles ?? "?"}개 × ${s.passes ?? "?"}패스 · ` +
+    `모델 호출 ${s.model_calls ?? "?"}회` +
+    (s.rereads ? ` · 재판독 ${s.rereads}회` : "") +
+    ` · ${s.wall_seconds ?? "?"}s`;
+  wrap.append(head);
+
+  // What the model worked out about the page before reading any of it. Shown
+  // above the table because it is the premise every value below rests on: if
+  // the column mapping is wrong here, every row is wrong in the same way.
+  const a = result.analysis;
+  if (a && (a.doc_type || (a.columns || []).length)) {
+    const box = document.createElement("div");
+    box.className = "analysis";
+    const line = document.createElement("div");
+    line.className = "analysis-line";
+    const bits = [];
+    if (a.doc_type) bits.push(`<strong>${escapeHtml(a.doc_type)}</strong>`);
+    if ((a.columns || []).length)
+      bits.push(`열: ${escapeHtml(a.columns.join(", "))}`);
+    line.innerHTML = "먼저 파악한 것 — " + bits.join(" · ");
+    box.append(line);
+
+    if (a.notes) {
+      const note = document.createElement("div");
+      note.className = "analysis-note";
+      note.textContent = `주의: ${a.notes}`;
+      box.append(note);
+    }
+    if (a.thinking) {
+      const { toggle, body } = buildDisclosure("판단 근거 보기", "판단 근거 숨기기", a.thinking);
+      box.append(toggle, body);
+    }
+    wrap.append(box);
+  }
+
+  const rowCount = (result.records || []).length;
+  const verdict = document.createElement("div");
+  if (rowCount === 0) {
+    // Nothing was extracted, so there is nothing that "passed". Saying so in
+    // green would be the exact silent-success failure this tool exists to
+    // avoid, one level up.
+    verdict.className = "extract-verdict empty";
+    verdict.textContent =
+      result.empty_reason ||
+      "이 이미지에서 스키마와 맞는 행을 찾지 못했습니다.";
+  } else {
+    verdict.className = "extract-verdict " + (flagged ? "warn" : "clean");
+    verdict.textContent = flagged
+      ? `${flagged}행은 사람이 확인해야 합니다. 표시된 셀을 눌러 근거를 보세요.`
+      : `${rowCount}행 모두 ${s.passes ?? 3}패스 일치 및 형식 검증을 통과했습니다.`;
+  }
+  wrap.append(verdict);
+
+  if (rowCount === 0) {
+    const help = document.createElement("div");
+    help.className = "extract-empty-help";
+    const fields = (result.fields || []).join(", ");
+    help.innerHTML = result.aborted
+      ? `<p>표를 읽기 전에 멈췄습니다. 모델 호출 ` +
+        `${s.model_calls ?? 1}회로 끝났으므로 헛돈 시간은 없습니다.</p>`
+      : `<p>선택한 스키마 <code>${escapeHtml(result.schema_name || "")}</code>는 ` +
+        `<code>${escapeHtml(fields)}</code> 열을 가진 표를 찾습니다. ` +
+        `이미지에 그런 표가 없으면 아무 행도 나오지 않습니다.</p>`;
+    wrap.append(help);
+
+    const retry = document.createElement("button");
+    retry.className = "retry-read";
+    retry.textContent = "이미지 읽기 모드로 다시 시도";
+    retry.onclick = () => retryAsRead(result);
+    wrap.append(retry);
+
+    if (result.samples && result.samples.length) {
+      const { toggle, body } = buildDisclosure(
+        "모델이 실제로 답한 내용 보기",
+        "모델 답변 숨기기",
+        result.samples.join("\n---\n")
+      );
+      wrap.append(toggle, body);
+    }
+    return wrap; // an empty table adds nothing
+  }
+
+  const scroll = document.createElement("div");
+  scroll.className = "extract-table-wrap";
+  const table = document.createElement("table");
+  table.className = "extract-table";
+
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  hr.append(document.createElement("th")); // row number
+  for (const name of result.fields) {
+    const th = document.createElement("th");
+    th.textContent = name;
+    hr.append(th);
+  }
+  thead.append(hr);
+  table.append(thead);
+
+  const tbody = document.createElement("tbody");
+  (result.records || []).forEach((rec, i) => {
+    const tr = document.createElement("tr");
+    const num = document.createElement("td");
+    num.className = "row-num";
+    num.textContent = i + 1;
+    if (rec.seen < rec.passes) {
+      num.classList.add("partial");
+      num.title = `${rec.passes}회 중 ${rec.seen}회만 관측됨`;
+    }
+    tr.append(num);
+
+    for (const name of result.fields) {
+      const cell = rec.cells[name] || {};
+      const td = document.createElement("td");
+      td.className = `cell status-${cell.status || "ok"}`;
+      td.textContent = cell.value || "";
+      if (cell.status && cell.status !== "ok") {
+        const parts = [STATUS_LABEL[cell.status] || cell.status];
+        if (cell.votes) parts.push(`득표 ${cell.votes}`);
+        if (cell.reason) parts.push(cell.reason);
+        if (cell.candidates && cell.candidates.length)
+          parts.push(`후보: ${cell.candidates.join(" / ")}`);
+        td.title = parts.join(" · ");
+        td.tabIndex = 0;
+        td.onclick = () => showCellDetail(td, name, cell);
+      }
+      tr.append(td);
+    }
+    tbody.append(tr);
+  });
+  table.append(tbody);
+  scroll.append(table);
+  wrap.append(scroll);
+
+  // Set aside, never hidden: a discarded row is still shown on request so the
+  // count can be checked against the source document.
+  if (result.discarded && result.discarded.length) {
+    const toggle = document.createElement("button");
+    toggle.className = "thinking-toggle";
+    toggle.innerHTML =
+      `<span>판독 실패로 제외한 ${result.discarded.length}행 보기</span>` +
+      `<span class="caret">⌄</span>`;
+    const body = document.createElement("div");
+    body.className = "thinking-body hidden";
+    body.textContent = result.discarded
+      .map((r, i) =>
+        `${i + 1}. ` +
+        result.fields.map((f) => `${f}=${r.cells[f]?.value || ""}`).join("  ")
+      )
+      .join("\n");
+    toggle.onclick = () => {
+      const open = body.classList.toggle("hidden") === false;
+      toggle.classList.toggle("open", open);
+      toggle.firstChild.textContent = open
+        ? `제외한 ${result.discarded.length}행 숨기기`
+        : `판독 실패로 제외한 ${result.discarded.length}행 보기`;
+    };
+    wrap.append(toggle, body);
+  }
+
+  if (result.problems && result.problems.length) {
+    const list = document.createElement("ul");
+    list.className = "extract-problems";
+    for (const p of result.problems) {
+      const li = document.createElement("li");
+      li.textContent = p;
+      list.append(li);
+    }
+    wrap.append(list);
+  }
+
+  wrap.append(buildExtractActions(result));
+  return wrap;
+}
+
+function showCellDetail(td, name, cell) {
+  const existing = td.querySelector(".cell-pop");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  document.querySelectorAll(".cell-pop").forEach((p) => p.remove());
+  const pop = document.createElement("div");
+  pop.className = "cell-pop";
+  const lines = [`${name}: ${STATUS_LABEL[cell.status] || cell.status}`];
+  if (cell.votes) lines.push(`득표 ${cell.votes}`);
+  if (cell.reason) lines.push(cell.reason);
+  if (cell.candidates && cell.candidates.length)
+    lines.push(`패스별 값: ${cell.candidates.join(" / ")}`);
+  pop.textContent = lines.join("\n");
+  pop.onclick = (e) => {
+    e.stopPropagation();
+    pop.remove();
+  };
+  td.append(pop);
+}
+
+function buildExtractActions(result) {
+  const row = document.createElement("div");
+  row.className = "msg-actions";
+
+  const csv = document.createElement("button");
+  csv.className = "icon-btn";
+  csv.textContent = "⤓";
+  csv.title = "CSV 복사 (검토 필요 셀은 ? 표시)";
+  csv.onclick = async () => {
+    const lines = [result.fields.join(",")];
+    for (const rec of result.records) {
+      lines.push(
+        result.fields
+          .map((f) => {
+            const c = rec.cells[f] || {};
+            const v = (c.value || "").replace(/"/g, '""');
+            // Never hand out a flagged value as if it were clean.
+            const mark = c.status && c.status !== "ok" ? "?" : "";
+            return `"${mark}${v}"`;
+          })
+          .join(",")
+      );
+    }
+    await navigator.clipboard.writeText(lines.join("\n"));
+    csv.textContent = "✓";
+    setTimeout(() => (csv.textContent = "⤓"), 1200);
+  };
+  row.append(csv);
+  return row;
 }
 
 function appendAssistant(answer, thinking) {
@@ -617,10 +937,144 @@ function scrollToBottom() {
 
 /* ---------------------------------------------------------------- sending */
 
+/* ----------------------------------------------------------- attachments */
+
+async function loadSchemas() {
+  try {
+    state.schemas = await api("/api/schemas");
+  } catch (_) {
+    state.schemas = [];
+  }
+  const sel = $("schema-select");
+  sel.innerHTML = "";
+  // Default to plain reading: an arbitrary image forced through a table schema
+  // yields nothing, which reads as a broken tool rather than a wrong choice.
+  const read = document.createElement("option");
+  read.value = READ_MODE;
+  read.textContent = "이미지 읽기 (표 아님, 검증 없음)";
+  sel.append(read);
+  for (const s of state.schemas) {
+    const opt = document.createElement("option");
+    opt.value = s.file;
+    opt.textContent = `표 추출: ${s.name} (${s.fields.join(", ")})`;
+    sel.append(opt);
+  }
+  syncSchemaHint();
+}
+
+function syncSchemaHint() {
+  const isRead = $("schema-select").value === READ_MODE;
+  $("passes-select").disabled = isRead;
+  $("passes-select").title = isRead
+    ? "읽기 모드에서는 다중 패스 검증을 쓰지 않습니다"
+    : "";
+  $("attach-hint").textContent = isRead
+    ? "이미지 내용을 그대로 읽습니다. 교차 검증은 하지 않습니다."
+    : "표를 찾아 스키마대로 추출하고, 패스 간 불일치를 표시합니다.";
+}
+
+function setAttachment(file) {
+  clearAttachment();
+  if (!file) return;
+  state.attachment = { file, url: URL.createObjectURL(file) };
+  $("attach-thumb").src = state.attachment.url;
+  $("attach-name").textContent =
+    `${file.name} · ${(file.size / 1024).toFixed(0)}KB`;
+  $("attach-bar").classList.remove("hidden");
+  if (!state.schemas.length) loadSchemas();
+}
+
+function clearAttachment({ keepUrl = false } = {}) {
+  // After sending, the blob URL is still the src of the thumbnail in the sent
+  // message; revoking it there would blank the image the user just posted.
+  // The bubble owns it from then on until the page reloads.
+  if (state.attachment && !keepUrl) URL.revokeObjectURL(state.attachment.url);
+  state.attachment = null;
+  $("file-input").value = "";
+  $("attach-bar").classList.add("hidden");
+}
+
+async function sendExtraction() {
+  const { file, url } = state.attachment;
+  const schemaFile = $("schema-select").value;
+  if (!schemaFile) {
+    notice("스키마가 없습니다. schemas/ 폴더에 JSON을 추가하세요.", true);
+    return;
+  }
+  if (!state.activeId) await newConversation();
+
+  const input = $("input");
+  const question = input.value.trim();
+  const isRead = schemaFile === READ_MODE;
+
+  const form = new FormData();
+  form.append("file", file);
+  form.append("conversation_id", state.activeId);
+  form.append("schema_file", schemaFile);
+  form.append("passes", $("passes-select").value);
+  if (isRead && question) form.append("question", question);
+
+  // Kept so a rejected extraction can be retried as a plain read without
+  // asking the user to find and attach the same file again.
+  state.lastImage = file;
+
+  const label = isRead
+    ? question || "[이미지 읽기]"
+    : `[이미지 추출] ${schemaFile.replace(/\.json$/, "")}`;
+  input.value = "";
+  input.style.height = "auto";
+  appendUser(label, url);
+  scrollToBottom();
+  const pending = notice("업로드 중…");
+  clearAttachment({ keepUrl: true });
+
+  let jobId;
+  try {
+    // Not api(): that helper always sets a JSON content type, and multipart
+    // needs the browser to set its own boundary.
+    const res = await fetch("/api/extract", {
+      method: "POST",
+      credentials: "same-origin",
+      body: form,
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `${res.status} ${res.statusText}`);
+    }
+    jobId = (await res.json()).job_id;
+  } catch (e) {
+    pending.remove();
+    notice(`추출 실패: ${e.message}`, true);
+    return;
+  }
+
+  state.jobId = jobId;
+  setStreaming(true);
+  streamJob(jobId, pending);
+}
+
+function retryAsRead() {
+  if (state.streaming) return;
+  if (!state.lastImage) {
+    notice("원본 이미지가 없습니다. 다시 첨부해 주세요.", true);
+    return;
+  }
+  setAttachment(state.lastImage);
+  $("schema-select").value = READ_MODE;
+  syncSchemaHint();
+  sendExtraction();
+}
+
 async function send() {
+  if (state.streaming) return;
+  if (state.attachment) {
+    await sendExtraction();
+    return;
+  }
+
   const input = $("input");
   const content = input.value.trim();
-  if (!content || state.streaming) return;
+  if (!content) return;
 
   if (!state.activeId) await newConversation();
 
@@ -721,7 +1175,7 @@ function streamJob(jobId, pendingNotice) {
 
   src.addEventListener("start", (e) => {
     const d = JSON.parse(e.data);
-    $("queue-chip").textContent = "생성 중";
+    $("queue-chip").textContent = d.mode === "extract" ? "추출 중" : "생성 중";
     pendingNotice.innerHTML =
       `<span class="dots"><span></span><span></span><span></span></span>`;
     if (d.dropped_turns > 0) {
@@ -729,6 +1183,20 @@ function streamJob(jobId, pendingNotice) {
         `컨텍스트 예산(${d.prompt_tokens.toLocaleString()} 토큰)에 맞추기 위해 ` +
           `오래된 대화 ${d.dropped_turns}턴을 제외했습니다.`
       );
+    }
+  });
+
+  src.addEventListener("progress", (e) => {
+    const d = JSON.parse(e.data);
+    if (d.phase === "probe") {
+      pendingNotice.textContent = "먼저 이미지 구조를 파악하는 중…";
+      $("queue-chip").textContent = "구조 파악";
+    } else if (d.phase === "tile") {
+      pendingNotice.textContent =
+        `읽는 중 — ${d.pass_index}/${d.passes}패스, 타일 ${d.tile}/${d.tiles}`;
+      $("queue-chip").textContent = `${d.pass_index}/${d.passes}패스`;
+    } else if (d.phase === "reread") {
+      pendingNotice.textContent = `${d.row}행 재판독 중 (패스 간 불일치)`;
     }
   });
 
@@ -760,6 +1228,26 @@ function streamJob(jobId, pendingNotice) {
 
   src.addEventListener("done", (e) => {
     const d = JSON.parse(e.data);
+
+    if (d.mode === "extract") {
+      pendingNotice.remove();
+      clearEmptyState();
+      const turn = document.createElement("div");
+      turn.className = "turn";
+      turn.append(renderExtraction(d.extraction));
+      const s = d.stats || {};
+      const line = document.createElement("div");
+      line.className = "stats-line";
+      line.textContent =
+        `호출 ${s.model_calls ?? "?"}회 · ${s.wall_seconds ?? "?"}s` +
+        (s.peak_gb ? ` · 피크 ${s.peak_gb}GB` : "");
+      turn.append(line);
+      $("thread").append(turn);
+      finish(src, pendingNotice);
+      loadConversations();
+      return;
+    }
+
     const n = ensureNode();
     clearDraft();
     n.body.innerHTML = renderMarkdown(answerRaw);
@@ -819,6 +1307,31 @@ function setStreaming(on) {
 /* ----------------------------------------------------------------- events */
 
 $("send").onclick = send;
+$("attach-btn").onclick = () => $("file-input").click();
+$("file-input").onchange = (e) => setAttachment(e.target.files[0]);
+$("attach-clear").onclick = clearAttachment;
+$("schema-select").onchange = syncSchemaHint;
+
+// Dropping an image anywhere on the thread stages it, which is how people
+// actually move a screenshot into a page.
+const thread = $("thread");
+["dragover", "drop"].forEach((ev) =>
+  thread.addEventListener(ev, (e) => {
+    e.preventDefault();
+    if (ev === "drop") {
+      const file = [...(e.dataTransfer?.files || [])].find((f) =>
+        f.type.startsWith("image/")
+      );
+      if (file) setAttachment(file);
+    }
+  })
+);
+document.addEventListener("paste", (e) => {
+  const item = [...(e.clipboardData?.items || [])].find((i) =>
+    i.type.startsWith("image/")
+  );
+  if (item) setAttachment(item.getAsFile());
+});
 $("stop").onclick = async () => {
   if (!state.jobId) return;
   try {

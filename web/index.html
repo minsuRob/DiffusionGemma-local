@@ -61,8 +61,27 @@
     </div>
 
     <div class="composer-wrap">
+      <div class="attach-bar hidden" id="attach-bar">
+        <img class="attach-thumb" id="attach-thumb" alt="첨부 이미지 미리보기">
+        <div class="attach-meta">
+          <div class="attach-name" id="attach-name"></div>
+          <div class="attach-controls">
+            <label for="schema-select">스키마</label>
+            <select id="schema-select"></select>
+            <label for="passes-select">검증</label>
+            <select id="passes-select">
+              <option value="3" selected>3패스 (권장)</option>
+              <option value="2">2패스</option>
+              <option value="1">1패스 (검증 없음)</option>
+            </select>
+          </div>
+          <div class="attach-hint" id="attach-hint"></div>
+        </div>
+        <button class="icon-btn" id="attach-clear" title="첨부 취소">×</button>
+      </div>
       <div class="composer">
-        <button class="icon-btn composer-plus" title="첨부 (미지원)" disabled>＋</button>
+        <button class="icon-btn composer-plus" id="attach-btn" title="이미지 첨부">＋</button>
+        <input type="file" id="file-input" accept="image/*" hidden>
         <textarea id="input" rows="1" placeholder="DiffusionGemma에게 물어보기"></textarea>
         <button class="send-btn" id="send" title="보내기">↑</button>
         <button class="send-btn stop hidden" id="stop" title="중지">■</button>
